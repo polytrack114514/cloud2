@@ -129,6 +129,17 @@ const readerBranch = (env) => env.READER_BRANCH || 'main';
 const readerPath = (env, p) =>
   `/repos/${readerOwner(env)}/${readerRepo(env)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`;
 
+/** 站点公告 / 访问开关 */
+const CONFIG_FILE = '.site-config.json';
+const DEFAULT_SITES = {
+  storage: { name: '云盘1', announcement: '', closed: false },
+  cloud2: { name: '云盘2', announcement: '', closed: false },
+  img: { name: '图床', announcement: '', closed: false },
+  reader: { name: '阅读器', announcement: '', closed: false },
+};
+const adminOk = (env, request) =>
+  (request.headers.get('X-Admin-Password') || '') === (env.ADMIN_PASSWORD || '2013');
+
 const assetUrl = (env, tag, name) =>
   `https://github.com/${env.REPO_OWNER}/${env.REPO_NAME}/releases/download/${tag}/${encodeURIComponent(name)}`;
 
@@ -359,7 +370,7 @@ export default {
     const cors = {
       'Access-Control-Allow-Origin': env.ALLOW_ORIGIN || '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, X-Password',
+      'Access-Control-Allow-Headers': 'Content-Type, X-Password, X-Admin-Password',
       'Access-Control-Max-Age': '86400',
       'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Content-Disposition',
     };
@@ -448,6 +459,84 @@ export default {
         }
         const out = await r.json();
         return json({ ok: true, path: p, sha: out.content ? out.content.sha : null }, 200, cors);
+      }
+
+      /* ---------- 站点公告 / 访问开关 ---------- */
+      if (request.method === 'GET' && route === '/site-config') {
+        const h = { ...cors, 'Cache-Control': 'no-store' };
+        const r = await gh(env, readerPath(env, CONFIG_FILE));
+        if (r.status === 404) return json({ sites: DEFAULT_SITES, updated: null }, 200, h);
+        if (!r.ok) return json({ error: '读取配置失败 HTTP ' + r.status }, 502, h);
+        const file = await r.json();
+        let cfg = null;
+        try {
+          const bin = atob(String(file.content || '').replace(/\s/g, ''));
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          cfg = JSON.parse(new TextDecoder().decode(bytes));
+        } catch (e) {}
+        const out = { sites: {}, updated: (cfg && cfg.updated) || null };
+        Object.keys(DEFAULT_SITES).forEach((k) => {
+          const s = (cfg && cfg.sites && cfg.sites[k]) || {};
+          out.sites[k] = {
+            name: DEFAULT_SITES[k].name,
+            announcement: String(s.announcement || ''),
+            closed: !!s.closed,
+          };
+        });
+        return json(out, 200, h);
+      }
+
+      if (request.method === 'POST' && route === '/site-config') {
+        const h = { ...cors, 'Cache-Control': 'no-store' };
+        if (!adminOk(env, request)) return json({ error: '管理员密码错误' }, 403, h);
+        let body = null;
+        try { body = await request.json(); } catch (e) {}
+        if (!body || !body.sites) return json({ error: '配置格式错误' }, 400, h);
+        const cfg = { sites: {}, updated: new Date().toISOString() };
+        Object.keys(DEFAULT_SITES).forEach((k) => {
+          const s = body.sites[k] || {};
+          cfg.sites[k] = {
+            name: DEFAULT_SITES[k].name,
+            announcement: String(s.announcement || '').slice(0, 500),
+            closed: !!s.closed,
+          };
+        });
+        const api = readerPath(env, CONFIG_FILE);
+        const head = await gh(env, api);
+        let sha = null;
+        if (head.ok) {
+          const meta = await head.json();
+          sha = meta.sha;
+        } else if (head.status !== 404) {
+          return json({ error: '读取配置失败 HTTP ' + head.status }, 502, h);
+        }
+        const putBody = {
+          message: 'Update site config',
+          content: stdB64(new TextEncoder().encode(JSON.stringify(cfg, null, 2))),
+          branch: readerBranch(env),
+        };
+        if (sha) putBody.sha = sha;
+        const put = await gh(env, api, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(putBody),
+        });
+        if (!put.ok) {
+          let msg = '';
+          try {
+            const j = await put.json();
+            msg = j.message || '';
+          } catch (e) {}
+          return json({ error: '保存失败 HTTP ' + put.status + (msg ? ' · ' + msg : '') }, 502, h);
+        }
+        return json({ ok: true, config: cfg }, 200, h);
+      }
+
+      if (request.method === 'GET' && route === '/admin/verify') {
+        const h = { ...cors, 'Cache-Control': 'no-store' };
+        if (!adminOk(env, request)) return json({ error: '管理员密码错误' }, 403, h);
+        return json({ ok: true }, 200, h);
       }
 
       /* ---------- 目录列表 ---------- */
