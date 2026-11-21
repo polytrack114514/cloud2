@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>文件云盘2 · 大文件分片上传</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%234f8cff'/%3E%3Cpath d='M12 5v9m0 0l4-4m-4 4l-4-4M5 17h14' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="文件云盘2" />
+<meta property="og:description" content="基于 Cloudflare R2 的大文件云盘，支持 100MB 以上、数 GB 级文件分片上传。" />
+<meta property="og:url" content="https://polytrack114514.github.io/cloud2/" />
+<meta name="twitter:card" content="summary" />
+<style>
+  :root {
+    --bg: #0d0f14;
+    --surface: #161a22;
+    --surface-2: #1d222c;
+    --border: #2a303c;
+    --border-strong: #3a4152;
+    --text: #e8eaef;
+    --muted: #8b93a3;
+    --accent: #4f8cff;
+    --accent-soft: rgba(79, 140, 255, 0.12);
+    --ok: #35c07a;
+    --warn: #e8a33d;
+    --err: #f0626b;
+    --radius: 14px;
+  }
+  :root[data-theme="light"] {
+    --bg: #f2f4f8;
+    --surface: #ffffff;
+    --surface-2: #f1f3f9;
+    --border: #dfe3ec;
+    --border-strong: #c7cedb;
+    --text: #1b2030;
+    --muted: #66708a;
+    --accent: #2f6bff;
+    --accent-soft: rgba(47, 107, 255, .1);
+    --ok: #1f9d63;
+    --warn: #c07f18;
+    --err: #d64550;
+  }
+  :root[data-theme="light"] body {
+    background: radial-gradient(1200px 600px at 15% -10%, #e6efff 0%, transparent 60%), var(--bg);
+  }
+  :root[data-theme="light"] .btn:hover { background: #eef2fb; }
+  :root[data-theme="light"] .toast { background: #fff; box-shadow: 0 16px 40px -12px rgba(20, 30, 60, .18); }
+  :root[data-theme="light"] .pv-body { background: #f6f8fc; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+  body {
+    background: radial-gradient(1200px 600px at 15% -10%, #1a2438 0%, transparent 60%), var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    font-size: 14px; line-height: 1.6; min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 80px; }
+
+  header { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 24px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 40px; height: 40px; border-radius: 11px; flex: none;
+    background: linear-gradient(140deg, #4f8cff, #7b5cff);
+    display: grid; place-items: center;
+    box-shadow: 0 8px 22px -8px rgba(79, 140, 255, 0.7);
+  }
+  .logo svg { width: 21px; height: 21px; }
+  h1 { font-size: 19px; font-weight: 650; margin: 0; letter-spacing: -0.2px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
+  .head-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  .repo-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 999px; padding: 7px 14px 7px 11px;
+    color: var(--text); text-decoration: none; font-size: 13px;
+    transition: border-color .18s, transform .18s;
+  }
+  .repo-chip:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(53,192,122,.15); }
+  .dot.off { background: var(--err); box-shadow: 0 0 0 3px rgba(240,98,107,.15); }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px; margin-bottom: 18px;
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .card-title { font-size: 14px; font-weight: 620; display: flex; align-items: center; gap: 8px; }
+  .stat { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+
+  .banner {
+    display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap;
+    background: rgba(232,163,61,.07); border: 1px solid rgba(232,163,61,.28);
+    border-radius: 12px; padding: 13px 15px; margin-bottom: 18px; font-size: 13px; color: #e9c184;
+  }
+  .banner b { color: #f3d3a0; }
+  .banner.err { background: rgba(240,98,107,.07); border-color: rgba(240,98,107,.3); color: #f0a8ad; }
+  .banner.err b { color: #ffc3c7; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 12px; color: var(--muted); font-weight: 500; }
+  input[type="text"], input[type="password"], select {
+    width: 100%; background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 9px 12px; font-size: 13px; font-family: inherit;
+    outline: none; transition: border-color .16s, box-shadow .16s;
+  }
+  select { cursor: pointer; }
+  input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  input::placeholder { color: #5c6474; }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    border: 1px solid var(--border-strong); background: var(--surface-2); color: var(--text);
+    padding: 8px 15px; border-radius: 10px; font-size: 13px; font-family: inherit;
+    cursor: pointer; transition: background .16s, border-color .16s, transform .1s; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); background: #202634; }
+  .btn:active { transform: scale(.975); }
+  .btn.sm { padding: 4px 10px; font-size: 12px; border-radius: 8px; }
+  .btn.ghost { background: transparent; border-color: var(--border); }
+  .btn.danger { color: var(--err); border-color: rgba(240,98,107,.35); }
+  .btn.danger:hover { background: rgba(240,98,107,.1); border-color: var(--err); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+  .drop {
+    border: 1.5px dashed var(--border-strong); border-radius: 12px;
+    padding: 34px 20px; text-align: center; cursor: pointer;
+    transition: border-color .18s, background .18s; background: rgba(255,255,255,.012);
+  }
+  .drop:hover, .drop.over { border-color: var(--accent); background: var(--accent-soft); }
+  .drop.over { border-style: solid; }
+  .drop svg { width: 34px; height: 34px; stroke: var(--muted); margin-bottom: 8px; }
+  .drop.over svg { stroke: var(--accent); }
+  .drop-main { font-size: 14px; font-weight: 600; }
+  .drop-sub { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+
+  .queue { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+  .item {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--surface-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; animation: fade .22s ease;
+  }
+  @keyframes fade { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  .item .fname { font-weight: 550; font-size: 13px; word-break: break-all; }
+  .item .fmeta { color: var(--muted); font-size: 11.5px; }
+  .grow { flex: 1; min-width: 0; }
+  .badge {
+    font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 600;
+    background: var(--surface); border: 1px solid var(--border); color: var(--muted); flex: none;
+  }
+  .badge.ok { color: var(--ok); border-color: rgba(53,192,122,.35); background: rgba(53,192,122,.1); }
+  .badge.err { color: var(--err); border-color: rgba(240,98,107,.35); background: rgba(240,98,107,.1); }
+  .badge.run { color: var(--accent); border-color: rgba(79,140,255,.4); background: var(--accent-soft); }
+  .bar { height: 3px; border-radius: 3px; background: var(--border); overflow: hidden; margin-top: 6px; }
+  .bar > i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #4f8cff, #7b5cff); transition: width .2s; }
+
+  .pathbar {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    font-size: 12.5px; color: var(--muted); margin-bottom: 12px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .crumb { cursor: pointer; padding: 2px 6px; border-radius: 6px; transition: background .15s; }
+  .crumb:hover { background: var(--surface-2); color: var(--accent); }
+
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar .searchbox { flex: 1; min-width: 180px; display: flex; gap: 6px; }
+  .toolbar select { width: auto; }
+
+  .files { display: flex; flex-direction: column; gap: 6px; }
+  .frow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; border-radius: 10px; border: 1px solid transparent;
+    transition: background .15s, border-color .15s;
+  }
+  .frow:hover { background: var(--surface-2); border-color: var(--border); }
+  .ficon {
+    width: 30px; height: 30px; flex: none; border-radius: 7px;
+    background: var(--surface-2); display: grid; place-items: center; overflow: hidden;
+  }
+  .ficon svg { width: 16px; height: 16px; stroke: var(--muted); }
+  .ficon img { width: 100%; height: 100%; object-fit: cover; }
+  .info { flex: 1; min-width: 0; cursor: pointer; }
+  .fname { font-size: 13.5px; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fmeta { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+  .actions { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; }
+  .empty { text-align: center; color: var(--muted); font-size: 13px; padding: 28px 10px; }
+  .newrow {
+    display: flex; align-items: center; gap: 8px; padding: 8px 12px; margin-top: 4px;
+    border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--muted); font-size: 13px; cursor: pointer;
+  }
+  .newrow:hover { border-color: var(--accent); color: var(--accent); }
+
+  .toast {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%) translateY(20px);
+    background: #1f2634; border: 1px solid var(--border-strong); color: var(--text);
+    padding: 10px 18px; border-radius: 10px; font-size: 13px; opacity: 0; pointer-events: none;
+    transition: opacity .2s, transform .2s; z-index: 90; box-shadow: 0 16px 40px -12px rgba(0,0,0,.6);
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.err { border-color: var(--err); color: #ffc3c7; }
+
+  .modal {
+    position: fixed; inset: 0; background: rgba(5,7,11,.72); backdrop-filter: blur(3px);
+    display: grid; place-items: center; padding: 20px; z-index: 80;
+  }
+  .pv { width: min(980px, 100%); max-height: 92vh; background: var(--surface); border: 1px solid var(--border); border-radius: 14px; display: flex; flex-direction: column; overflow: hidden; }
+  .pv-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+  .pv-title { flex: 1; min-width: 0; font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pv-body { flex: 1; overflow: auto; background: #0b0d12; display: grid; place-items: center; min-height: 200px; }
+  .pv-body img, .pv-body video { max-width: 100%; max-height: 76vh; display: block; }
+  .pv-body iframe { width: 100%; height: 76vh; border: 0; background: #fff; }
+  .pv-body pre { margin: 0; padding: 16px; width: 100%; color: var(--text); font-size: 12.5px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .pv-foot { padding: 10px 16px; border-top: 1px solid var(--border); display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
+
+  footer.site {
+    margin-top: 34px; padding-top: 18px; border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    font-size: 12px; color: var(--muted);
+  }
+  footer.site a { color: var(--muted); text-decoration: none; border-bottom: 1px dotted var(--border-strong); }
+  footer.site a:hover { color: var(--accent); border-color: var(--accent); }
+  footer.site .fright { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  @media (max-width: 640px) {
+    .actions .btn.sm span.lbl { display: none; }
+    .frow { flex-wrap: wrap; }
+    .info { flex: 1 1 100%; order: -1; }
+    .actions { width: 100%; justify-content: flex-start; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 4v10m0 0l4.5-4.5M12 14l-4.5-4.5"/><path d="M4 16.5A3.5 3.5 0 0 0 5 23h14a3.5 3.5 0 0 0 1-6.5"/>
+        </svg>
+      </div>
+      <div>
+        <h1>文件云盘2</h1>
+        <div class="sub">Cloudflare R2 · 分片上传 · 单文件可传 100MB 以上</div>
+      </div>
+    </div>
+    <div class="head-right">
+      <a class="repo-chip" id="repoChip" href="https://github.com/polytrack114514/cloud2" target="_blank" rel="noopener">
+        <span class="dot" id="statusDot"></span>
+        <span id="repoText">polytrack114514/cloud2</span>
+      </a>
+      <a class="repo-chip" href="https://polytrack114514.github.io/storage/" target="_blank" rel="noopener">云盘 1</a>
+      <a class="repo-chip" href="https://polytrack114514.github.io/img/" target="_blank" rel="noopener">图床</a>
+      <button class="btn ghost sm" id="btnTheme" title="切换主题">主题</button>
+    </div>
+  </header>
+
+  <div class="banner err" id="cfgBanner" hidden>
+    <div><b>后端未就绪。</b><span id="cfgMsg"></span></div>
+  </div>
+
+  <section class="card">
+    <div class="card-head">
+      <div class="card-title">上传<span class="stat" id="quotaStat"></span></div>
+      <div class="toolbar" style="margin:0">
+        <input type="password" id="passInput" placeholder="上传口令" style="width:130px" autocomplete="off" />
+        <button class="btn ghost sm" id="btnSavePass">保存口令</button>
+      </div>
+    </div>
+    <div class="drop" id="drop">
+      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 16V5m0 0L8 9m4-4l4 4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/>
+      </svg>
+      <div class="drop-main">点击选择文件，或把文件拖到这里</div>
+      <div class="drop-sub">自动按 8MB 分片上传，支持 100MB 以上甚至数 GB 的单文件</div>
+      <input type="file" id="fileInput" multiple hidden />
+      <input type="file" id="dirInput" webkitdirectory directory multiple hidden />
+    </div>
+    <div class="toolbar" style="margin:10px 0 0">
+      <button class="btn sm" id="btnPick">选择文件</button>
+      <button class="btn sm ghost" id="btnPickDir">上传整个文件夹</button>
+      <span class="stat" id="upTip">上传到：根目录</span>
+    </div>
+    <div class="queue" id="queue"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <div class="card-title">文件<span class="stat" id="listStat"></span></div>
+      <div class="toolbar" style="margin:0">
+        <button class="btn sm" id="btnMkdir">新建文件夹</button>
+        <button class="btn sm ghost" id="btnRefresh">刷新</button>
+      </div>
+    </div>
+
+    <div class="pathbar" id="pathbar"></div>
+
+    <div class="toolbar">
+      <div class="searchbox">
+        <input type="text" id="searchInput" placeholder="全局搜索文件名 / 路径…" autocomplete="off" />
+        <button class="btn sm" id="btnSearch">搜索</button>
+      </div>
+      <select id="sortKey">
+        <option value="name">名称</option>
+        <option value="size">大小</option>
+        <option value="time">时间</option>
+      </select>
+      <button class="btn sm ghost" id="btnSortDir" title="切换升降序">↑ 升序</button>
+    </div>
+
+    <div class="files" id="files"></div>
+    <div class="newrow" id="newRow" hidden>+ 新建文件夹</div>
+  </section>
+
+  <footer class="site">
+    <div>创作者：<a href="https://github.com/polytrack114514" target="_blank" rel="noopener">Shen Xiong</a> · 致谢 AI：TRAE CN（DeepSeek-V4.1-Flash）</div>
+    <div class="fright">
+      <a href="https://polytrack114514.github.io/storage/" target="_blank" rel="noopener">云盘 1</a>
+      <a href="https://polytrack114514.github.io/img/" target="_blank" rel="noopener">图床</a>
+      <span>© 2026 cloud2.</span>
+    </div>
+  </footer>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<div class="modal" id="modal" hidden>
+  <div class="pv">
+    <div class="pv-head">
+      <div class="pv-title" id="pvTitle"></div>
+      <button class="btn sm ghost" id="pvClose">关闭</button>
+    </div>
+    <div class="pv-body" id="pvBody"></div>
+    <div class="pv-foot">
+      <button class="btn sm" id="pvCopy">复制链接</button>
+      <a class="btn sm" id="pvDownload" href="#" download>下载</a>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var WORKER_KEY = 'c2_worker';
+  var PASS_KEY = 'c2_pass';
+  var SORT_KEY = 'c2_sort';
+  var THEME_KEY = 'c2_theme';
+  var PART_SIZE = 8 * 1024 * 1024;
+  var CONCURRENCY = 2;
+
+  var worker = localStorage.getItem(WORKER_KEY) || 'https://file-cloud-2.pages.dev';
+  var pass = localStorage.getItem(PASS_KEY) || '';
+  var curPath = '';
+  var items = [];
+  var folded = [];
+  var entering = false;
+
+  var sortKey = 'name';
+  var sortDir = 1;
+
+  var IMG_RE = /\.(jpe?g|png|gif|webp|svg|bmp|ico|avif)$/i;
+  var VID_RE = /\.(mp4|webm|mov|mkv)$/i;
+  var AUD_RE = /\.(mp3|wav|flac|m4a|ogg)$/i;
+  var TXT_RE = /\.(txt|md|json|js|css|html?|xml|csv|log|yml|yaml|ini)$/i;
+  var PDF_RE = /\.pdf$/i;
+
+  function base() { return String(worker || '').replace(/\/+$/, ''); }
+  function encKey(k) { return k.split('/').map(encodeURIComponent).join('/'); }
+  function fileUrl(key, dl) { return base() + '/file/' + encKey(key) + (dl ? '?download=1' : ''); }
+  function joinPath(dir, name) { return dir ? dir + '/' + name : name; }
+
+  function fmtSize(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / 1048576).toFixed(2) + ' MB';
+    return (n / 1073741824).toFixed(2) + ' GB';
+  }
+  function fmtTime(t) {
+    if (!t) return '';
+    var d = new Date(t);
+    if (isNaN(d.getTime())) return '';
+    var p = function (x) { return x < 10 ? '0' + x : '' + x; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  var toastTimer;
+  function toast(msg, isErr) {
+    var el = $('toast');
+    el.textContent = msg;
+    el.className = 'toast show' + (isErr ? ' err' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.className = 'toast'; }, 2600);
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    var headers = { 'X-Password': pass };
+    if (opts.json) headers['Content-Type'] = 'application/json';
+    return fetch(base() + path, {
+      method: opts.method || 'GET',
+      headers: headers,
+      body: opts.json ? JSON.stringify(opts.json) : opts.body,
+    }).then(function (r) {
+      return r.text().then(function (t) {
+        var j = null;
+        try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
+        if (!r.ok) throw new Error((j && j.error) || ('HTTP ' + r.status));
+        return j;
+      });
+    });
+  }
+
+  function copyText(t) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(t).then(function () { toast('已复制'); });
+    }
+    var ta = document.createElement('textarea');
+    ta.value = t;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toast('已复制'); } catch (e) { toast('复制失败', true); }
+    document.body.removeChild(ta);
+  }
+
+  /* ---------- 图标 ---------- */
+  function iconFor(name) {
+    var c = 'currentColor';
+    if (IMG_RE.test(name)) return '<svg viewBox="0 0 24 24" fill="none" stroke="' + c + '"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.5"/><path d="M21 16l-5-5-6 6-3-3-4 4"/></svg>';
+    if (VID_RE.test(name)) return '<svg viewBox="0 0 24 24" fill="none" stroke="' + c + '"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9l5 3-5 3z"/></svg>';
+    if (AUD_RE.test(name)) return '<svg viewBox="0 0 24 24" fill="none" stroke="' + c + '"><path d="M9 18V6l10-2v12"/><circle cx="6.5" cy="18" r="2.5"/><circle cx="16.5" cy="16" r="2.5"/></svg>';
+    if (PDF_RE.test(name)) return '<svg viewBox="0 0 24 24" fill="none" stroke="' + c + '"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="' + c + '"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>';
+  }
+  var FOLDER_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+
+  /* ---------- 渲染 ---------- */
+  function renderPath() {
+    var bar = $('pathbar');
+    var parts = curPath ? curPath.split('/') : [];
+    var html = '<span class="crumb" data-path="">根目录</span>';
+    var acc = '';
+    parts.forEach(function (p) {
+      acc = acc ? acc + '/' + p : p;
+      html += '<span>/</span><span class="crumb" data-path="' + esc(acc) + '">' + esc(p) + '</span>';
+    });
+    bar.innerHTML = html;
+    Array.prototype.forEach.call(bar.querySelectorAll('.crumb'), function (el) {
+      el.addEventListener('click', function () { open(el.getAttribute('data-path')); });
+    });
+    $('upTip').textContent = '上传到：' + (curPath ? curPath : '根目录');
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function sorted(list, dirs) {
+    var arr = list.slice();
+    arr.sort(function (a, b) {
+      if (dirs) {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+      }
+      var r = 0;
+      if (sortKey === 'size') r = (a.size || 0) - (b.size || 0);
+      else if (sortKey === 'time') r = (Date.parse(a.time || 0) || 0) - (Date.parse(b.time || 0) || 0);
+      else r = String(a.name).localeCompare(String(b.name), 'zh-CN');
+      if (r === 0) r = String(a.name).localeCompare(String(b.name), 'zh-CN');
+      return r * sortDir;
+    });
+    return arr;
+  }
+
+  function renderList() {
+    var box = $('files');
+    var dirs = folded.map(function (f) { return { isDir: true, name: f, size: 0, time: null }; });
+    var all = sorted(dirs.concat(items.map(function (f) {
+      return { isDir: false, name: f.name, size: f.size, time: f.uploaded, key: f.key };
+    })), true);
+
+    var total = items.reduce(function (s, f) { return s + (f.size || 0); }, 0);
+    $('listStat').textContent = dirs.length + ' 个文件夹 · ' + items.length + ' 个文件 · ' + fmtSize(total);
+
+    if (!all.length) {
+      box.innerHTML = '<div class="empty">这个目录还是空的，拖文件到上面就能上传</div>';
+    } else {
+      box.innerHTML = all.map(function (it) {
+        var nameEnc = esc(it.name);
+        if (it.isDir) {
+          return '<div class="frow" data-dir="' + nameEnc + '">' +
+            '<div class="ficon" style="color:var(--accent)">' + FOLDER_SVG + '</div>' +
+            '<div class="info"><div class="fname">' + nameEnc + '</div><div class="fmeta">文件夹</div></div>' +
+            '<div class="actions">' +
+            '<button class="btn sm ghost" data-act="open">打开</button>' +
+            '<button class="btn sm ghost" data-act="renameDir">改名</button>' +
+            '<button class="btn sm danger" data-act="delDir">删除</button>' +
+            '</div></div>';
+        }
+        var thumb = IMG_RE.test(it.name)
+          ? '<img loading="lazy" src="' + esc(fileUrl(it.key, false)) + '" alt="" />'
+          : iconFor(it.name);
+        return '<div class="frow" data-key="' + esc(it.key) + '" data-name="' + nameEnc + '">' +
+          '<div class="ficon">' + thumb + '</div>' +
+          '<div class="info" data-act="open"><div class="fname">' + nameEnc + '</div>' +
+          '<div class="fmeta">' + fmtSize(it.size) + (it.time ? ' · ' + fmtTime(it.time) : '') + '</div></div>' +
+          '<div class="actions">' +
+          '<button class="btn sm ghost" data-act="copy">链接</button>' +
+          '<button class="btn sm ghost" data-act="rename">改名</button>' +
+          '<button class="btn sm ghost" data-act="move">移动</button>' +
+          '<button class="btn sm danger" data-act="del">删除</button>' +
+          '</div></div>';
+      }).join('');
+    }
+    $('newRow').hidden = false;
+  }
+
+  function onFilesClick(e) {
+    var row = e.target.closest('.frow');
+    if (!row) return;
+    var btn = e.target.closest('[data-act]');
+    var act = btn ? btn.getAttribute('data-act') : 'none';
+    if (row.hasAttribute('data-dir')) {
+      var dname = row.getAttribute('data-dir');
+      var dpath = joinPath(curPath, dname);
+      if (!btn || act === 'open') return open(dpath);
+      if (act === 'renameDir') return renameDir(dname, dpath);
+      if (act === 'delDir') return removePaths([dpath + '/'], '文件夹「' + dname + '」');
+      return;
+    }
+    var key = row.getAttribute('data-key');
+    var name = row.getAttribute('data-name');
+    if (!btn || act === 'open') return preview(key, name);
+    if (act === 'copy') return copyText(fileUrl(key, false));
+    if (act === 'rename') return renameFile(key, name);
+    if (act === 'move') return moveFile(key, name);
+    if (act === 'del') return removePaths([key], '文件「' + name + '」');
+  }
+
+  /* ---------- 目录加载 ---------- */
+  function open(path) {
+    if (entering) return;
+    entering = true;
+    curPath = path || '';
+    $('searchInput').value = '';
+    load().finally(function () { entering = false; });
+  }
+
+  function load() {
+    return api('/list?prefix=' + encodeURIComponent(curPath))
+      .then(function (j) {
+        folded = j.folders || [];
+        items = j.files || [];
+        setOnline(true);
+        renderPath();
+        renderList();
+        loadQuota();
+      })
+      .catch(function (e) {
+        setOnline(false);
+        showCfg('读取目录失败：' + e.message);
+        $('files').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+      });
+  }
+
+  var quotaLoaded = false;
+  function loadQuota() {
+    if (quotaLoaded) return;
+    quotaLoaded = true;
+    api('/stats').then(function (j) {
+      $('quotaStat').textContent = '共 ' + j.count + ' 个文件 · ' + fmtSize(j.bytes);
+    }).catch(function () { /* 忽略 */ });
+  }
+
+  function setOnline(on) {
+    var d = $('statusDot');
+    d.className = 'dot ' + (on ? 'on' : 'off');
+    if (on) $('cfgBanner').hidden = true;
+  }
+  function showCfg(msg) {
+    $('cfgMsg').textContent = msg;
+    $('cfgBanner').hidden = false;
+  }
+
+  /* ---------- 上传 ---------- */
+  function queueItem(file, label) {
+    var el = document.createElement('div');
+    el.className = 'item';
+    el.innerHTML = '<div class="grow"><div class="fname">' + esc(label || file.name) + '</div>' +
+      '<div class="fmeta">' + fmtSize(file.size) + ' · 等待上传</div>' +
+      '<div class="bar"><i></i></div></div>' +
+      '<span class="badge">等待</span>';
+    $('queue').appendChild(el);
+    return el;
+  }
+  function setItemState(el, text, cls, barW, meta) {
+    var b = el.querySelector('.badge');
+    b.textContent = text;
+    b.className = 'badge' + (cls ? ' ' + cls : '');
+    if (barW != null) el.querySelector('.bar > i').style.width = barW + '%';
+    if (meta) el.querySelector('.fmeta').textContent = meta;
+  }
+
+  function uploadOne(file, relName) {
+    var key = joinPath(curPath, relName || file.name);
+    var el = queueItem(file, key);
+    setItemState(el, '上传中', 'run', 0, fmtSize(0) + ' / ' + fmtSize(file.size));
+
+    var startTs = Date.now();
+
+    function done() {
+      setItemState(el, '完成', 'ok', 100, fmtSize(file.size) + ' · 用时 ' + Math.max(1, Math.round((Date.now() - startTs) / 1000)) + 's');
+      quotaLoaded = false;
+      load();
+    }
+    function fail(e) {
+      setItemState(el, '失败', 'err', null, '上传失败：' + e.message);
+    }
+
+    if (file.size === 0) {
+      return fetch(base() + '/put?key=' + encodeURIComponent(key) + '&type=' + encodeURIComponent(file.type || 'application/octet-stream'), {
+        method: 'POST', headers: { 'X-Password': pass }, body: file
+      }).then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        done();
+      }).catch(fail);
+    }
+
+    var totalParts = Math.ceil(file.size / PART_SIZE);
+    var init;
+    return api('/mp/init', { method: 'POST', json: { key: key, size: file.size, type: file.type || '', password: pass } })
+      .then(function (j) {
+        init = j;
+        var next = 0;
+        var finished = 0;
+        var parts = new Array(totalParts);
+
+        function workerLoop() {
+          if (next >= totalParts) return Promise.resolve();
+          var idx = next++;
+          var start = idx * PART_SIZE;
+          var end = Math.min(file.size, start + PART_SIZE);
+          var blob = file.slice(start, end);
+          var attempt = 0;
+
+          function tryPart() {
+            return fetch(base() + '/mp/part?key=' + encodeURIComponent(key) + '&uploadId=' + encodeURIComponent(init.uploadId) + '&n=' + (idx + 1), {
+              method: 'PUT',
+              headers: { 'X-Password': pass, 'Content-Type': 'application/octet-stream' },
+              body: blob
+            }).then(function (r) {
+              if (!r.ok) {
+                return r.text().then(function (t) { throw new Error(t || ('HTTP ' + r.status)); });
+              }
+              return r.json();
+            }).then(function (j2) {
+              parts[idx] = { partNumber: j2.partNumber || (idx + 1), etag: j2.etag };
+              finished += 1;
+              var pct = Math.round(finished / totalParts * 100);
+              var sent = Math.round(file.size * finished / totalParts);
+              var sec = Math.max(1, (Date.now() - startTs) / 1000);
+              var speed = sent / sec;
+              setItemState(el, '上传中', 'run', pct, fmtSize(sent) + ' / ' + fmtSize(file.size) + ' · ' + fmtSize(speed) + '/s');
+            }).catch(function (e) {
+              attempt += 1;
+              if (attempt >= 3) throw new Error('第 ' + (idx + 1) + ' 片失败：' + e.message);
+              return sleep(400 * attempt).then(tryPart);
+            }).then(workerLoop);
+          }
+          return tryPart();
+        }
+
+        var loops = [];
+        for (var i = 0; i < Math.min(CONCURRENCY, totalParts); i++) loops.push(workerLoop());
+        return Promise.all(loops).then(function () {
+          return api('/mp/complete', {
+            method: 'POST',
+            json: { key: key, uploadId: init.uploadId, parts: parts, size: file.size, password: pass }
+          });
+        });
+      })
+      .then(done)
+      .catch(function (e) {
+        fail(e);
+        if (init && init.uploadId) {
+          api('/mp/abort', { method: 'POST', json: { key: key, uploadId: init.uploadId, password: pass } }).catch(function () {});
+        }
+      });
+  }
+
+  var uploading = 0;
+  function handleFiles(list) {
+    var files = Array.prototype.slice.call(list || []);
+    if (!files.length) return;
+    if (!pass) {
+      toast('请先填写上传口令', true);
+      $('passInput').focus();
+      return;
+    }
+    files.forEach(function (f) {
+      var rel = f.webkitRelativePath || f.name;
+      uploading += 1;
+      uploadOne(f, rel).finally(function () { uploading -= 1; });
+    });
+  }
+
+  /* ---------- 操作 ---------- */
+  function removePaths(keys, label) {
+    if (!pass) { toast('请先填写上传口令', true); return; }
+    if (!confirm('确定删除' + label + '？此操作不可恢复。')) return;
+    api('/delete', { method: 'POST', json: { keys: keys, password: pass } })
+      .then(function (j) { toast('已删除 ' + (j.removed || 0) + ' 项'); quotaLoaded = false; load(); })
+      .catch(function (e) { toast('删除失败：' + e.message, true); });
+  }
+
+  function renameFile(key, name) {
+    if (!pass) { toast('请先填写上传口令', true); return; }
+    var nn = prompt('新的文件名（可带子目录，如 docs/a.txt）', name);
+    if (!nn || nn === name) return;
+    var to = joinPath(curPath, nn.trim());
+    api('/move', { method: 'POST', json: { from: key, to: to, password: pass } })
+      .then(function () { toast('已改名'); load(); })
+      .catch(function (e) { toast('改名失败：' + e.message, true); });
+  }
+
+  function moveFile(key, name) {
+    if (!pass) { toast('请先填写上传口令', true); return; }
+    var dest = prompt('移动到目录（留空表示根目录；不存在的目录会自动创建）', curPath ? '' : '');
+    if (dest === null) return;
+    var to = joinPath(dest.trim().replace(/^\/+|\/+$/g, ''), name);
+    if (to === key) return toast('目标位置相同');
+    api('/move', { method: 'POST', json: { from: key, to: to, password: pass } })
+      .then(function () { toast('已移动到 ' + (dest.trim() || '根目录')); load(); })
+      .catch(function (e) { toast('移动失败：' + e.message, true); });
+  }
+
+  function renameDir(dname, dpath) {
+    if (!pass) { toast('请先填写上传口令', true); return; }
+    var nn = prompt('新的文件夹名', dname);
+    if (!nn || nn === dname) return;
+    var target = joinPath(curPath, nn.trim());
+    toast('正在改名，文件夹较大时请稍候…');
+    api('/mvdir', { method: 'POST', json: { from: dpath, to: target, password: pass } })
+      .then(function () { toast('已改名'); load(); })
+      .catch(function (e) { toast('改名失败：' + e.message, true); });
+  }
+
+  function mkdir() {
+    if (!pass) { toast('请先填写上传口令', true); $('passInput').focus(); return; }
+    var n = prompt('新文件夹名称', '新建文件夹');
+    if (!n) return;
+    api('/mkdir', { method: 'POST', json: { path: joinPath(curPath, n.trim()), password: pass } })
+      .then(function () { toast('已创建'); load(); })
+      .catch(function (e) { toast('创建失败：' + e.message, true); });
+  }
+
+  /* ---------- 预览 ---------- */
+  function preview(key, name) {
+    var body = $('pvBody');
+    var url = fileUrl(key, false);
+    $('pvTitle').textContent = name;
+    $('pvDownload').setAttribute('href', fileUrl(key, true));
+    $('pvDownload').setAttribute('download', name);
+    $('pvCopy').onclick = function () { copyText(url); };
+    body.innerHTML = '';
+    if (IMG_RE.test(name)) {
+      body.innerHTML = '<img src="' + esc(url) + '" alt="" />';
+    } else if (VID_RE.test(name)) {
+      body.innerHTML = '<video src="' + esc(url) + '" controls autoplay></video>';
+    } else if (AUD_RE.test(name)) {
+      body.innerHTML = '<audio src="' + esc(url) + '" controls autoplay style="width:min(560px,90%)"></audio>';
+    } else if (PDF_RE.test(name)) {
+      body.innerHTML = '<iframe src="' + esc(url) + '"></iframe>';
+    } else if (TXT_RE.test(name)) {
+      body.innerHTML = '<pre>加载中…</pre>';
+      fetch(url).then(function (r) { return r.text(); }).then(function (t) {
+        if (t.length > 400000) t = t.slice(0, 400000) + '\n\n…（内容过长，已截断）';
+        $('pvBody').innerHTML = '<pre>' + esc(t) + '</pre>';
+      }).catch(function (e) {
+        $('pvBody').innerHTML = '<pre>读取失败：' + esc(e.message) + '</pre>';
+      });
+    } else {
+      body.innerHTML = '<div class="empty">这种文件不支持在线预览，可以直接下载</div>';
+    }
+    $('modal').hidden = false;
+  }
+  function closeModal() {
+    $('modal').hidden = true;
+    $('pvBody').innerHTML = '';
+  }
+
+  /* ---------- 搜索 ---------- */
+  function doSearch() {
+    var q = $('searchInput').value.trim();
+    if (!q) return load();
+    api('/search?q=' + encodeURIComponent(q))
+      .then(function (list) {
+        items = (list || []).map(function (o) {
+          return { name: o.key.split('/').pop(), key: o.key, size: o.size, uploaded: o.uploaded };
+        });
+        folded = [];
+        var dirs = (list || []).map(function (o) { return o.key.split('/').slice(0, -1).join('/'); })
+          .filter(function (v, i, a) { return v && a.indexOf(v) === i; });
+        $('listStat').textContent = '搜索「' + q + '」找到 ' + items.length + ' 个文件';
+        renderPath();
+        renderList();
+        if (dirs.length) $('listStat').textContent += ' · 分布在 ' + dirs.length + ' 个目录';
+      })
+      .catch(function (e) { toast('搜索失败：' + e.message, true); });
+  }
+
+  /* ---------- 事件绑定 ---------- */
+  function initPass() {
+    $('passInput').value = pass;
+    $('btnSavePass').addEventListener('click', function () {
+      pass = $('passInput').value.trim();
+      localStorage.setItem(PASS_KEY, pass);
+      toast(pass ? '口令已保存到本机' : '已清空口令');
+    });
+  }
+
+  function initTheme() {
+    var t = localStorage.getItem(THEME_KEY) || 'dark';
+    document.documentElement.setAttribute('data-theme', t);
+    $('btnTheme').addEventListener('click', function () {
+      var cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+      var nxt = cur === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', nxt);
+      localStorage.setItem(THEME_KEY, nxt);
+      $('btnTheme').textContent = nxt === 'light' ? '暗色' : '主题';
+    });
+  }
+
+  function initSort() {
+    var s = localStorage.getItem(SORT_KEY);
+    if (s) {
+      var p = s.split(':');
+      sortKey = p[0] || 'name';
+      sortDir = p[1] === 'desc' ? -1 : 1;
+    }
+    $('sortKey').value = sortKey;
+    $('btnSortDir').textContent = sortDir === 1 ? '↑ 升序' : '↓ 降序';
+    $('sortKey').addEventListener('change', function () {
+      sortKey = this.value;
+      localStorage.setItem(SORT_KEY, sortKey + ':' + (sortDir === 1 ? 'asc' : 'desc'));
+      renderList();
+    });
+    $('btnSortDir').addEventListener('click', function () {
+      sortDir = -sortDir;
+      this.textContent = sortDir === 1 ? '↑ 升序' : '↓ 降序';
+      localStorage.setItem(SORT_KEY, sortKey + ':' + (sortDir === 1 ? 'asc' : 'desc'));
+      renderList();
+    });
+  }
+
+  function initUpload() {
+    var drop = $('drop');
+    drop.addEventListener('click', function () { $('fileInput').click(); });
+    $('btnPick').addEventListener('click', function () { $('fileInput').click(); });
+    $('btnPickDir').addEventListener('click', function () { $('dirInput').click(); });
+    $('fileInput').addEventListener('change', function () { handleFiles(this.files); this.value = ''; });
+    $('dirInput').addEventListener('change', function () { handleFiles(this.files); this.value = ''; });
+
+    ['dragenter', 'dragover'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('over'); });
+    });
+    ['dragleave', 'drop'].forEach(function (ev) {
+      drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('over'); });
+    });
+    drop.addEventListener('drop', function (e) {
+      if (e.dataTransfer && e.dataTransfer.files) handleFiles(e.dataTransfer.files);
+    });
+  }
+
+  function initListEvents() {
+    $('files').addEventListener('click', onFilesClick);
+    $('btnMkdir').addEventListener('click', mkdir);
+    $('newRow').addEventListener('click', mkdir);
+    $('btnRefresh').addEventListener('click', function () { quotaLoaded = false; load(); });
+    $('btnSearch').addEventListener('click', doSearch);
+    $('searchInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') doSearch(); });
+    $('pvClose').addEventListener('click', closeModal);
+    $('modal').addEventListener('click', function (e) { if (e.target === this) closeModal(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') closeModal(); });
+  }
+
+  initTheme();
+  initPass();
+  initSort();
+  initUpload();
+  initListEvents();
+  open('');
+})();
+</script>
+</body>
+</html>
