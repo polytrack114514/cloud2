@@ -107,35 +107,65 @@ const gh = (env, path, opts = {}) =>
 
 const tagOf = (env) => env.TAG || 'cloud2-data';
 
-const assetUrl = (env, name) =>
-  `https://github.com/${env.REPO_OWNER}/${env.REPO_NAME}/releases/download/${tagOf(env)}/${encodeURIComponent(name)}`;
+/** 第 1 个桶用基础 tag，之后依次 -2 / -3 …；每个 Release 最多 1000 个 asset */
+const MAX_ASSETS = 995;
+const shardTag = (base, i) => (i <= 1 ? base : base + '-' + i);
+const shardIndex = (base, t) => (t === base ? 1 : (parseInt(String(t).slice(base.length + 1), 10) || 0));
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-let relCache = null;
+const assetUrl = (env, tag, name) =>
+  `https://github.com/${env.REPO_OWNER}/${env.REPO_NAME}/releases/download/${tag}/${encodeURIComponent(name)}`;
 
-const ensureRelease = async (env) => {
-  const key = env.REPO_OWNER + '/' + env.REPO_NAME + '@' + tagOf(env);
-  if (relCache && relCache.key === key) return relCache.rel;
-  const base = `/repos/${env.REPO_OWNER}/${env.REPO_NAME}`;
-  const r = await gh(env, base + '/releases/tags/' + encodeURIComponent(tagOf(env)));
-  if (r.ok) {
-    const rel = await r.json();
-    relCache = { key, rel };
-    return rel;
+let shardCache = { key: null, list: [] };
+
+const listRepoReleases = async (env) => {
+  const out = [];
+  for (let page = 1; page <= 3; page++) {
+    const r = await gh(env, `/repos/${env.REPO_OWNER}/${env.REPO_NAME}/releases?per_page=100&page=${page}`);
+    if (!r.ok) {
+      if (r.status === 404) return out;
+      throw new Error('读取 Release 列表失败：HTTP ' + r.status);
+    }
+    const j = await r.json();
+    if (!Array.isArray(j) || !j.length) break;
+    for (const x of j) out.push(x);
+    if (j.length < 100) break;
   }
-  if (r.status !== 404) throw new Error('读取 Release 失败：HTTP ' + r.status);
-  const c = await gh(env, base + '/releases', {
+  return out;
+};
+
+const createShard = async (env, base, i) => {
+  const tag = shardTag(base, i);
+  const r = await gh(env, `/repos/${env.REPO_OWNER}/${env.REPO_NAME}/releases`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      tag_name: tagOf(env),
-      name: '云盘数据',
+      tag_name: tag,
+      name: i <= 1 ? '云盘数据' : '云盘数据 ' + i,
       body: '由「文件云盘2」自动管理，请不要在这里手动上传或删除文件。',
     }),
   });
-  if (!c.ok) throw new Error('创建 Release 失败：HTTP ' + c.status + ' ' + (await c.text()).slice(0, 200));
-  const rel = await c.json();
-  relCache = { key, rel };
-  return rel;
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error('创建 Release 失败：HTTP ' + r.status + ' ' + t.slice(0, 180));
+  }
+  return { rel: await r.json(), count: 0 };
+};
+
+/** 按序返回所有分桶，cache：count 为已知 asset 数（undefined 表示未知） */
+const loadShards = async (env) => {
+  const base = tagOf(env);
+  const key = env.REPO_OWNER + '/' + env.REPO_NAME + '@' + base;
+  if (shardCache.key === key && shardCache.list.length) return shardCache.list;
+  const all = await listRepoReleases(env);
+  const re = new RegExp('^' + escapeRe(base) + '-\\d+$');
+  const mine = all
+    .filter((x) => x.tag_name === base || re.test(x.tag_name))
+    .sort((a, b) => shardIndex(base, a.tag_name) - shardIndex(base, b.tag_name))
+    .map((rel) => ({ rel, count: undefined }));
+  if (!mine.length) mine.push(await createShard(env, base, 1));
+  shardCache = { key, list: mine };
+  return mine;
 };
 
 const listAssets = async (env, relId) => {
@@ -152,11 +182,10 @@ const listAssets = async (env, relId) => {
   return out;
 };
 
-const uploadAsset = async (env, name, bytes) => {
-  const rel = await ensureRelease(env);
+const doUpload = async (env, shard, name, bytes) => {
   const u =
     'https://uploads.github.com/repos/' + env.REPO_OWNER + '/' + env.REPO_NAME +
-    '/releases/' + rel.id + '/assets?name=' + encodeURIComponent(name);
+    '/releases/' + shard.rel.id + '/assets?name=' + encodeURIComponent(name);
   const r = await fetch(u, {
     method: 'POST',
     headers: {
@@ -169,9 +198,52 @@ const uploadAsset = async (env, name, bytes) => {
   });
   if (!r.ok) {
     const t = await r.text();
-    throw new Error('分片上传失败 HTTP ' + r.status + ' ' + t.slice(0, 180));
+    const err = new Error('分片上传失败 HTTP ' + r.status + ' ' + t.slice(0, 180));
+    err.status = r.status;
+    throw err;
   }
+  if (typeof shard.count === 'number') shard.count += 1;
   return r.json();
+};
+
+const maxAssets = (env) => {
+  const n = parseInt(env.SHARD_LIMIT || '', 10);
+  return n >= 2 ? n : MAX_ASSETS;
+};
+
+/** 往当前最新的桶里写；桶满（≥1000 个 asset）时自动新建下一个桶 */
+const uploadAsset = async (env, name, bytes) => {
+  const limit = maxAssets(env);
+  const shards = await loadShards(env);
+  let target = shards[shards.length - 1];
+  if (target.count === undefined) target.count = (await listAssets(env, target.rel.id)).length;
+  if (target.count >= limit) {
+    target = await createShard(env, tagOf(env), shards.length + 1);
+    shards.push(target);
+    shardCache.list = shards;
+  }
+  try {
+    return await doUpload(env, target, name, bytes);
+  } catch (e) {
+    // 计数不准（并发上传）时桶可能刚好写满，开新桶重试一次
+    if (e.status === 422 && target.count >= limit - 10) {
+      const next = await createShard(env, tagOf(env), shards.length + 1);
+      shards.push(next);
+      shardCache.list = shards;
+      return doUpload(env, next, name, bytes);
+    }
+    // 桶被手工删掉：丢掉缓存重新找最新的桶
+    if (e.status === 404) {
+      shardCache = { key: null, list: [] };
+      const fresh = await loadShards(env);
+      const last = fresh[fresh.length - 1];
+      if (last.rel.id !== target.rel.id) {
+        if (last.count === undefined) last.count = (await listAssets(env, last.rel.id)).length;
+        return doUpload(env, last, name, bytes);
+      }
+    }
+    throw e;
+  }
 };
 
 const delAsset = (env, id) =>
@@ -179,32 +251,36 @@ const delAsset = (env, id) =>
 
 /** 建立索引：files: Map(path -> {parts,size,time})，dirs: Set(路径，不含根) */
 const buildIndex = async (env) => {
-  const rel = await ensureRelease(env);
-  const assets = await listAssets(env, rel.id);
+  const shards = await loadShards(env);
+  const lists = await Promise.all(shards.map((s) => listAssets(env, s.rel.id)));
+  shards.forEach((s, i) => { s.count = lists[i].length; });
   const files = new Map();
   const dirs = new Set();
   const dirAssets = [];
-  for (const a of assets) {
-    const p = parseAsset(a.name);
-    if (!p) continue;
-    const segs = String(p.path).split('/').filter(Boolean);
-    if (!segs.length) continue;
-    let acc = '';
-    if (p.kind === 'dir') {
-      for (const s of segs) { acc = acc ? acc + '/' + s : s; dirs.add(acc); }
-      dirAssets.push({ path: p.path, id: a.id });
-      continue;
+  for (let si = 0; si < lists.length; si++) {
+    const tag = shards[si].rel.tag_name;
+    for (const a of lists[si]) {
+      const p = parseAsset(a.name);
+      if (!p) continue;
+      const segs = String(p.path).split('/').filter(Boolean);
+      if (!segs.length) continue;
+      let acc = '';
+      if (p.kind === 'dir') {
+        for (const s of segs) { acc = acc ? acc + '/' + s : s; dirs.add(acc); }
+        dirAssets.push({ path: p.path, id: a.id });
+        continue;
+      }
+      for (let i = 0; i < segs.length - 1; i++) { acc = acc ? acc + '/' + segs[i] : segs[i]; dirs.add(acc); }
+      const f = files.get(p.path) || { parts: [], size: 0, time: null };
+      const logical = p.zero ? 0 : a.size;
+      f.parts.push({ n: p.n, id: a.id, name: a.name, size: logical, url: assetUrl(env, tag, a.name) });
+      f.size += logical;
+      if (!f.time || String(a.created_at) > String(f.time)) f.time = a.created_at;
+      files.set(p.path, f);
     }
-    for (let i = 0; i < segs.length - 1; i++) { acc = acc ? acc + '/' + segs[i] : segs[i]; dirs.add(acc); }
-    const f = files.get(p.path) || { parts: [], size: 0, time: null };
-    const logical = p.zero ? 0 : a.size;
-    f.parts.push({ n: p.n, id: a.id, name: a.name, size: logical, url: assetUrl(env, a.name) });
-    f.size += logical;
-    if (!f.time || String(a.created_at) > String(f.time)) f.time = a.created_at;
-    files.set(p.path, f);
   }
   files.forEach((f) => f.parts.sort((a, b) => a.n - b.n));
-  return { files, dirs, dirAssets };
+  return { files, dirs, dirAssets, shards };
 };
 
 /** 删除某个文件的全部切片 */
