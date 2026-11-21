@@ -113,6 +113,22 @@ const shardTag = (base, i) => (i <= 1 ? base : base + '-' + i);
 const shardIndex = (base, t) => (t === base ? 1 : (parseInt(String(t).slice(base.length + 1), 10) || 0));
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
+/** 标准 base64（用于 GitHub Contents API） */
+const stdB64 = (bytes) => {
+  let bin = '';
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+  }
+  return btoa(bin);
+};
+
+const readerOwner = (env) => env.READER_OWNER || 'polytrack114514';
+const readerRepo = (env) => env.READER_REPO || 'reader';
+const readerBranch = (env) => env.READER_BRANCH || 'main';
+const readerPath = (env, p) =>
+  `/repos/${readerOwner(env)}/${readerRepo(env)}/contents/${p.split('/').map(encodeURIComponent).join('/')}`;
+
 const assetUrl = (env, tag, name) =>
   `https://github.com/${env.REPO_OWNER}/${env.REPO_NAME}/releases/download/${tag}/${encodeURIComponent(name)}`;
 
@@ -371,6 +387,67 @@ export default {
     try {
       if (route === '/' || route === '/health') {
         return json({ ok: true, service: 'file-cloud-2', storage: 'github-releases', tag: tagOf(env) }, 200, cors);
+      }
+
+      /* ---------- 阅读器仓库代理（reader） ---------- */
+      if (request.method === 'GET' && route === '/reader/tree') {
+        const r = await gh(env, `/repos/${readerOwner(env)}/${readerRepo(env)}/git/trees/${readerBranch(env)}?recursive=1`);
+        if (!r.ok) return json({ error: 'GitHub 返回 HTTP ' + r.status }, 502, cors);
+        const d = await r.json();
+        const files = (d.tree || [])
+          .filter((x) => x.type === 'blob')
+          .map((x) => ({ path: x.path, size: x.size || 0 }))
+          .sort((a, b) => a.path.localeCompare(b.path));
+        return json({ files }, 200, cors);
+      }
+
+      if (request.method === 'POST' && route === '/reader/upload') {
+        const origin = request.headers.get('Origin') || '';
+        if (origin !== 'https://polytrack114514.github.io') {
+          return json({ error: '来源不受允许' }, 403, cors);
+        }
+        const p = String(url.searchParams.get('path') || '').trim().replace(/^\/+/, '');
+        if (!p || p.length > 400 || p.indexOf('\\') >= 0 ||
+            p.split('/').some((s) => !s || s === '.' || s === '..') ||
+            p.indexOf('uploads/') !== 0) {
+          return json({ error: '路径无效，只能上传到 uploads 目录' }, 400, cors);
+        }
+        const overwrite = url.searchParams.get('overwrite') === '1';
+        const max = Number(env.READER_MAX_BYTES || 26214400);
+        const buf = new Uint8Array(await request.arrayBuffer());
+        if (buf.length > max) {
+          return json({ error: '文件超过 ' + Math.round(max / 1048576) + 'MB' }, 413, cors);
+        }
+        const api = readerPath(env, p);
+        const head = await gh(env, api);
+        if (head.ok && !overwrite) return json({ error: '同名文件已存在' }, 409, cors);
+        if (!head.ok && head.status !== 404) {
+          return json({ error: '检查同名文件失败 HTTP ' + head.status }, 502, cors);
+        }
+        const body = {
+          message: 'Upload ' + p,
+          content: stdB64(buf),
+          branch: readerBranch(env),
+        };
+        if (head.ok) {
+          const meta = await head.json();
+          body.sha = meta.sha;
+        }
+        const r = await gh(env, api, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          let msg = '';
+          try {
+            const j = await r.json();
+            msg = j.message || '';
+          } catch (e) {}
+          return json({ error: 'GitHub 返回 HTTP ' + r.status + (msg ? ' · ' + msg : '') }, 502, cors);
+        }
+        const out = await r.json();
+        return json({ ok: true, path: p, sha: out.content ? out.content.sha : null }, 200, cors);
       }
 
       /* ---------- 目录列表 ---------- */
