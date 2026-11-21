@@ -1,12 +1,18 @@
 /**
  * 文件云盘2 后端（Cloudflare Pages Functions / Worker）
  *
- * 存储：Cloudflare R2（绑定名 BUCKET）
- * 环境变量：
- *   UPLOAD_PASSWORD （加密变量，可选）写操作口令，默认不校验
- *   ALLOW_ORIGIN    （明文，可选）允许的来源，默认 *
+ * 存储：GitHub Releases（免绑卡，单文件上限 2GB）
+ *   - 每个文件按 8MB 切片，每片是一个 release asset：p.<路径base64url>.<片号>
+ *   - 空文件夹用 0 字节 asset 占位：d.<路径base64url>
+ *   - 下载时由本 Worker 顺序拉取分片并流式拼接，支持 Range（视频可拖动）
  *
- * 特点：分片上传，单文件可达数 GB（前端按 8MiB 切片，逐片 PUT）。
+ * 环境变量：
+ *   GH_TOKEN        （加密变量，必填）对 REPO 有 Contents: Read and write 的令牌
+ *   REPO_OWNER      （明文，必填）polytrack114514
+ *   REPO_NAME       （明文，必填）cloud2
+ *   TAG             （明文，可选）数据所在的 release tag，默认 cloud2-data
+ *   UPLOAD_PASSWORD （加密变量，可选）写操作口令
+ *   ALLOW_ORIGIN    （明文，可选）允许的来源，默认 *
  */
 
 const json = (obj, status, cors) =>
@@ -39,7 +45,6 @@ const guessType = (name) => {
   return TYPE_MAP[ext] || 'application/octet-stream';
 };
 
-/** 中文文件名在 Content-Disposition 里需要 RFC5987 编码 */
 const disposition = (name, download) => {
   const ascii = String(name).replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
   return `${download ? 'attachment' : 'inline'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
@@ -47,17 +52,214 @@ const disposition = (name, download) => {
 
 const keyOf = (p) => String(p || '').replace(/^\/+|\/+$/g, '');
 
-/** 递归列出某个前缀下的所有对象 */
-const listAll = async (bucket, prefix) => {
+/* ---------- 路径 ⇄ asset 名 ---------- */
+const b64url = (s) => {
+  const bytes = new TextEncoder().encode(s);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+};
+
+const unb64url = (s) => {
+  let t = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (t.length % 4) t += '=';
+  const bin = atob(t);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+};
+
+const partName = (path, n, zero) => 'p.' + b64url(path) + '.' + n + (zero ? '.0' : '');
+const dirName = (path) => 'd.' + b64url(path);
+
+const parseAsset = (name) => {
+  if (name.indexOf('d.') === 0) return { kind: 'dir', path: unb64url(name.slice(2)) };
+  if (name.indexOf('p.') === 0) {
+    const rest = name.slice(2);
+    const seg = rest.split('.');
+    if (seg.length >= 2) {
+      return {
+        kind: 'part',
+        path: unb64url(seg[0]),
+        n: Number(seg[1]),
+        zero: seg[2] === '0',
+      };
+    }
+  }
+  return null;
+};
+
+/** GitHub 不接受 0 字节 asset，用 1 字节占位 */
+const PLACEHOLDER = new Uint8Array([120]);
+
+/* ---------- GitHub API ---------- */
+const gh = (env, path, opts = {}) =>
+  fetch('https://api.github.com' + path, {
+    ...opts,
+    headers: {
+      Authorization: 'Bearer ' + env.GH_TOKEN,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'file-cloud-2-worker',
+      ...(opts.headers || {}),
+    },
+  });
+
+const tagOf = (env) => env.TAG || 'cloud2-data';
+
+const assetUrl = (env, name) =>
+  `https://github.com/${env.REPO_OWNER}/${env.REPO_NAME}/releases/download/${tagOf(env)}/${encodeURIComponent(name)}`;
+
+let relCache = null;
+
+const ensureRelease = async (env) => {
+  const key = env.REPO_OWNER + '/' + env.REPO_NAME + '@' + tagOf(env);
+  if (relCache && relCache.key === key) return relCache.rel;
+  const base = `/repos/${env.REPO_OWNER}/${env.REPO_NAME}`;
+  const r = await gh(env, base + '/releases/tags/' + encodeURIComponent(tagOf(env)));
+  if (r.ok) {
+    const rel = await r.json();
+    relCache = { key, rel };
+    return rel;
+  }
+  if (r.status !== 404) throw new Error('读取 Release 失败：HTTP ' + r.status);
+  const c = await gh(env, base + '/releases', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      tag_name: tagOf(env),
+      name: '云盘数据',
+      body: '由「文件云盘2」自动管理，请不要在这里手动上传或删除文件。',
+    }),
+  });
+  if (!c.ok) throw new Error('创建 Release 失败：HTTP ' + c.status + ' ' + (await c.text()).slice(0, 200));
+  const rel = await c.json();
+  relCache = { key, rel };
+  return rel;
+};
+
+const listAssets = async (env, relId) => {
+  const base = `/repos/${env.REPO_OWNER}/${env.REPO_NAME}/releases/${relId}/assets?per_page=100&page=`;
   const out = [];
-  let cursor;
-  for (;;) {
-    const r = await bucket.list({ prefix, limit: 1000, cursor });
-    for (const o of r.objects) out.push(o);
-    if (!r.truncated) break;
-    cursor = r.cursor;
+  for (let page = 1; page <= 20; page++) {
+    const r = await gh(env, base + page);
+    if (!r.ok) break;
+    const j = await r.json();
+    if (!Array.isArray(j) || !j.length) break;
+    for (const a of j) out.push(a);
+    if (j.length < 100) break;
   }
   return out;
+};
+
+const uploadAsset = async (env, name, bytes) => {
+  const rel = await ensureRelease(env);
+  const u =
+    'https://uploads.github.com/repos/' + env.REPO_OWNER + '/' + env.REPO_NAME +
+    '/releases/' + rel.id + '/assets?name=' + encodeURIComponent(name);
+  const r = await fetch(u, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + env.GH_TOKEN,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/octet-stream',
+      'User-Agent': 'file-cloud-2-worker',
+    },
+    body: bytes,
+  });
+  if (!r.ok) {
+    const t = await r.text();
+    throw new Error('分片上传失败 HTTP ' + r.status + ' ' + t.slice(0, 180));
+  }
+  return r.json();
+};
+
+const delAsset = (env, id) =>
+  gh(env, '/repos/' + env.REPO_OWNER + '/' + env.REPO_NAME + '/releases/assets/' + id, { method: 'DELETE' });
+
+/** 建立索引：files: Map(path -> {parts,size,time})，dirs: Set(路径，不含根) */
+const buildIndex = async (env) => {
+  const rel = await ensureRelease(env);
+  const assets = await listAssets(env, rel.id);
+  const files = new Map();
+  const dirs = new Set();
+  const dirAssets = [];
+  for (const a of assets) {
+    const p = parseAsset(a.name);
+    if (!p) continue;
+    const segs = String(p.path).split('/').filter(Boolean);
+    if (!segs.length) continue;
+    let acc = '';
+    if (p.kind === 'dir') {
+      for (const s of segs) { acc = acc ? acc + '/' + s : s; dirs.add(acc); }
+      dirAssets.push({ path: p.path, id: a.id });
+      continue;
+    }
+    for (let i = 0; i < segs.length - 1; i++) { acc = acc ? acc + '/' + segs[i] : segs[i]; dirs.add(acc); }
+    const f = files.get(p.path) || { parts: [], size: 0, time: null };
+    const logical = p.zero ? 0 : a.size;
+    f.parts.push({ n: p.n, id: a.id, name: a.name, size: logical, url: assetUrl(env, a.name) });
+    f.size += logical;
+    if (!f.time || String(a.created_at) > String(f.time)) f.time = a.created_at;
+    files.set(p.path, f);
+  }
+  files.forEach((f) => f.parts.sort((a, b) => a.n - b.n));
+  return { files, dirs, dirAssets };
+};
+
+/** 删除某个文件的全部切片 */
+const dropFile = async (env, f) => {
+  for (const p of f.parts) {
+    try { await delAsset(env, p.id); } catch (e) { /* 已删除则忽略 */ }
+  }
+};
+
+/* ---------- Range ---------- */
+const parseRange = (h, size) => {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(h || '').trim());
+  if (!m) return null;
+  let start;
+  let end;
+  if (m[1] === '') {
+    const len = parseInt(m[2], 10);
+    if (!len) return null;
+    start = Math.max(0, size - len);
+    end = size - 1;
+  } else {
+    start = parseInt(m[1], 10);
+    end = m[2] === '' ? size - 1 : parseInt(m[2], 10);
+  }
+  if (isNaN(start) || isNaN(end) || start > end || start >= size) return null;
+  return { start, end: Math.min(end, size - 1) };
+};
+
+/** 把若干分片按字节区间拼成一条流 */
+const mergeStream = (parts, start, end) => {
+  const ranges = [];
+  let off = 0;
+  for (const p of parts) {
+    const ps = off;
+    const pe = off + p.size - 1;
+    off += p.size;
+    const s = Math.max(start, ps);
+    const e = Math.min(end, pe);
+    if (s <= e) ranges.push({ url: p.url, from: s - ps, to: e - ps });
+  }
+  let idx = 0;
+  return new ReadableStream({
+    async pull(controller) {
+      if (idx >= ranges.length) { controller.close(); return; }
+      const r = ranges[idx++];
+      const resp = await fetch(r.url, { headers: { Range: 'bytes=' + r.from + '-' + r.to } });
+      if (!resp.ok || !resp.body) throw new Error('分片读取失败 HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      for (;;) {
+        const c = await reader.read();
+        if (c.done) break;
+        controller.enqueue(c.value);
+      }
+    },
+  });
 };
 
 export default {
@@ -67,13 +269,14 @@ export default {
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, X-Password',
       'Access-Control-Max-Age': '86400',
-      'Access-Control-Expose-Headers': 'X-Total-Count, Content-Disposition',
+      'Access-Control-Expose-Headers': 'Content-Range, Content-Length, Content-Disposition',
     };
 
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
-    const bucket = env.BUCKET;
-    if (!bucket) return json({ error: '后端未绑定 R2 桶，请检查 BUCKET 绑定' }, 500, cors);
+    if (!env.GH_TOKEN || !env.REPO_OWNER || !env.REPO_NAME) {
+      return json({ error: '后端未配置：缺少 GH_TOKEN / REPO_OWNER / REPO_NAME' }, 500, cors);
+    }
 
     const url = new URL(request.url);
     const route = url.pathname.replace(/\/+$/, '') || '/';
@@ -90,242 +293,259 @@ export default {
     };
 
     try {
-      // ---------- 健康检查 ----------
       if (route === '/' || route === '/health') {
-        return json({ ok: true, service: 'file-cloud-2', r2: true }, 200, cors);
+        return json({ ok: true, service: 'file-cloud-2', storage: 'github-releases', tag: tagOf(env) }, 200, cors);
       }
 
-      // ---------- 目录列表 ----------
+      /* ---------- 目录列表 ---------- */
       if (request.method === 'GET' && route === '/list') {
-        const prefix = keyOf(url.searchParams.get('prefix') || '');
-        const pre = prefix ? prefix + '/' : '';
-        const cursor = url.searchParams.get('cursor') || undefined;
-        const r = await bucket.list({ prefix: pre, delimiter: '/', limit: 500, cursor });
-        const folders = (r.delimitedPrefixes || [])
-          .map((p) => p.slice(pre.length).replace(/\/$/, ''))
-          .filter(Boolean);
-        const files = (r.objects || [])
-          .filter((o) => o.key !== pre)
-          .map((o) => ({
-            name: o.key.slice(pre.length),
-            key: o.key,
-            size: o.size,
-            uploaded: o.uploaded ? new Date(o.uploaded).toISOString() : null,
-            etag: o.etag,
-            type: (o.httpMetadata && o.httpMetadata.contentType) || '',
-          }))
-          .filter((f) => f.name && f.name.indexOf('/') < 0);
-        return json({ prefix, folders, files, cursor: r.cursor || null, truncated: !!r.truncated }, 200, cors);
+        const prefix = keyOf(url.searchParams.get('prefix'));
+        const idx = await buildIndex(env);
+        const folders = [];
+        idx.dirs.forEach((d) => {
+          if (!d) return;
+          if (prefix && d.indexOf(prefix + '/') !== 0) return;
+          const rest = prefix ? d.slice(prefix.length + 1) : d;
+          if (rest && rest.indexOf('/') < 0) folders.push(rest);
+        });
+        const files = [];
+        idx.files.forEach((f, path) => {
+          const dir = path.indexOf('/') >= 0 ? path.slice(0, path.lastIndexOf('/')) : '';
+          if (dir !== prefix) return;
+          files.push({
+            name: path.split('/').pop(),
+            key: path,
+            size: f.size,
+            uploaded: f.time,
+            etag: String(f.parts.length),
+            type: guessType(path),
+          });
+        });
+        folders.sort((a, b) => a.localeCompare(b, 'zh-CN'));
+        return json({ prefix, folders, files, cursor: null, truncated: false }, 200, cors);
       }
 
-      // ---------- 站点统计 ----------
+      /* ---------- 统计 ---------- */
       if (request.method === 'GET' && route === '/stats') {
-        let count = 0;
+        const idx = await buildIndex(env);
         let bytes = 0;
-        let cursor;
-        for (;;) {
-          const r = await bucket.list({ limit: 1000, cursor });
-          for (const o of r.objects) {
-            if (o.key.endsWith('/')) continue;
-            count += 1;
-            bytes += o.size;
-          }
-          if (!r.truncated) break;
-          cursor = r.cursor;
-        }
-        return json({ count, bytes }, 200, cors);
+        idx.files.forEach((f) => { bytes += f.size; });
+        return json({ count: idx.files.size, bytes }, 200, cors);
       }
 
-      // ---------- 全局搜索 ----------
+      /* ---------- 搜索 ---------- */
       if (request.method === 'GET' && route === '/search') {
         const q = String(url.searchParams.get('q') || '').trim().toLowerCase();
         if (!q) return json([], 200, cors);
-        const all = await listAll(bucket, '');
-        const hits = all
-          .filter((o) => !o.key.endsWith('/') && o.key.toLowerCase().includes(q))
-          .slice(0, 200)
-          .map((o) => ({
-            key: o.key,
-            size: o.size,
-            uploaded: o.uploaded ? new Date(o.uploaded).toISOString() : null,
-          }));
-        return json(hits, 200, cors);
+        const idx = await buildIndex(env);
+        const hits = [];
+        idx.files.forEach((f, path) => {
+          if (path.toLowerCase().indexOf(q) >= 0) hits.push({ key: path, size: f.size, uploaded: f.time });
+        });
+        hits.sort((a, b) => a.key.localeCompare(b.key, 'zh-CN'));
+        return json(hits.slice(0, 200), 200, cors);
       }
 
-      // ---------- 文件下载 / 预览（支持 Range，便于视频拖动） ----------
-      if (request.method === 'GET' && route.startsWith('/file/')) {
+      /* ---------- 下载 / 预览 ---------- */
+      if (request.method === 'GET' && route.indexOf('/file/') === 0) {
         const key = decodeURIComponent(route.slice('/file/'.length));
         if (!key) return json({ error: '缺少文件路径' }, 400, cors);
-        const head = await bucket.head(key);
-        if (!head) return json({ error: '文件不存在' }, 404, cors);
-        const range = request.headers.get('Range') || undefined;
-        const obj = await bucket.get(key, range ? { range } : undefined);
-        if (!obj) return json({ error: '文件不存在' }, 404, cors);
+        const idx = await buildIndex(env);
+        const f = idx.files.get(key);
+        if (!f || !f.parts.length) return json({ error: '文件不存在' }, 404, cors);
 
         const name = key.split('/').pop();
         const ext = String(name).split('.').pop().toLowerCase();
         const risky = ['html', 'htm', 'svg', 'xml'].indexOf(ext) >= 0;
+        const total = f.size;
         const h = new Headers(cors);
-        h.set('Content-Type', (head.httpMetadata && head.httpMetadata.contentType) || guessType(name));
+        h.set('Content-Type', guessType(name));
         h.set('Content-Disposition', disposition(name, url.searchParams.get('download') === '1' || risky));
         h.set('Accept-Ranges', 'bytes');
         h.set('X-Content-Type-Options', 'nosniff');
-        h.set('ETag', head.etag);
         h.set('Cache-Control', 'public, max-age=300');
-        if (obj.range) {
-          const r0 = obj.range;
-          if (r0.offset !== undefined) {
-            h.set('Content-Range', `bytes ${r0.offset}-${r0.offset + r0.length - 1}/${head.size}`);
-          }
-          h.set('Content-Length', String(obj.size));
-          return new Response(obj.body, { status: 206, headers: h });
+
+        const rg = parseRange(request.headers.get('Range'), total);
+        if (!total) {
+          h.set('Content-Length', '0');
+          return new Response(null, { status: 200, headers: h });
         }
-        h.set('Content-Length', String(head.size));
-        return new Response(obj.body, { status: 200, headers: h });
+        if (rg) {
+          h.set('Content-Range', 'bytes ' + rg.start + '-' + rg.end + '/' + total);
+          h.set('Content-Length', String(rg.end - rg.start + 1));
+          return new Response(mergeStream(f.parts, rg.start, rg.end), { status: 206, headers: h });
+        }
+        h.set('Content-Length', String(total));
+        return new Response(mergeStream(f.parts, 0, total - 1), { status: 200, headers: h });
       }
 
-      // ---------- 写操作：统一校验口令 ----------
+      /* ---------- 写操作 ---------- */
       if (request.method === 'POST' || request.method === 'DELETE') {
         const ct = request.headers.get('Content-Type') || '';
-        const body = ct.includes('application/json') ? await readBody(request) : {};
+        const body = ct.indexOf('application/json') >= 0 ? await readBody(request) : {};
         const pass = headerPass || body.password;
         if (!passOk(pass)) return json({ error: '口令不正确' }, 401, cors);
 
-        // 小文件直传（也用于创建 0 字节占位）
+        // 小文件直传（单片）
         if (route === '/put') {
           const key = keyOf(url.searchParams.get('key'));
           if (!key) return json({ error: '缺少 key' }, 400, cors);
-          const name = key.split('/').pop();
-          const meta = { contentType: guessType(name) };
-          const t = url.searchParams.get('type');
-          if (t) meta.contentType = t;
-          await bucket.put(key, request.body || new Uint8Array(0), { httpMetadata: meta });
+          const idx = await buildIndex(env);
+          const old = idx.files.get(key);
+          if (old) await dropFile(env, old);
+          const buf = await request.arrayBuffer();
+          const zero = buf.byteLength === 0;
+          await uploadAsset(env, partName(key, 1, zero), zero ? PLACEHOLDER : new Uint8Array(buf));
           return json({ ok: true, key }, 200, cors);
         }
 
-        // 新建文件夹（用一个以 / 结尾的空对象占位）
+        // 新建文件夹
         if (route === '/mkdir') {
           const p = keyOf(body.path);
           if (!p) return json({ error: '缺少文件夹名' }, 400, cors);
-          await bucket.put(p + '/', new Uint8Array(0), {
-            httpMetadata: { contentType: 'application/x-directory' },
-          });
+          try {
+            await uploadAsset(env, dirName(p), PLACEHOLDER);
+          } catch (e) {
+            if (String(e.message).indexOf('422') < 0) throw e;
+          }
           return json({ ok: true, path: p }, 200, cors);
         }
 
-        // 删除（支持文件与文件夹）
+        // 删除（文件 / 文件夹）
         if (route === '/delete') {
           const keys = Array.isArray(body.keys) ? body.keys : body.key ? [body.key] : [];
           if (!keys.length) return json({ error: '缺少 keys' }, 400, cors);
+          const idx = await buildIndex(env);
           let removed = 0;
           for (const raw of keys) {
             const k = String(raw || '');
             if (!k) continue;
-            if (k.endsWith('/')) {
-              const list = await listAll(bucket, k);
-              for (let i = 0; i < list.length; i += 100) {
-                const batch = list.slice(i, i + 100).map((o) => o.key);
-                if (batch.length) await bucket.delete(batch);
-                removed += batch.length;
+            const base = k.replace(/\/+$/, '');
+            if (!k.endsWith('/') && idx.files.has(k)) {
+              const f = idx.files.get(k);
+              removed += f.parts.length;
+              await dropFile(env, f);
+              continue;
+            }
+            const victims = [];
+            idx.files.forEach((f, path) => {
+              if (path === base || path.indexOf(base + '/') === 0) victims.push(f);
+            });
+            for (const f of victims) { removed += f.parts.length; await dropFile(env, f); }
+            for (const d of idx.dirAssets) {
+              if (d.path === base || d.path.indexOf(base + '/') === 0) {
+                try { await delAsset(env, d.id); removed += 1; } catch (e) { /* ignore */ }
               }
-            } else {
-              await bucket.delete(k);
-              removed += 1;
             }
           }
           return json({ ok: true, removed }, 200, cors);
         }
 
-        // 改名 / 移动
+        // 文件改名 / 移动
         if (route === '/move') {
           const from = keyOf(body.from);
           const to = keyOf(body.to);
           if (!from || !to || from === to) return json({ error: '路径无效' }, 400, cors);
-          const obj = await bucket.get(from);
-          if (!obj) return json({ error: '源文件不存在' }, 404, cors);
-          await bucket.put(to, obj.body, {
-            httpMetadata: obj.httpMetadata || { contentType: guessType(to.split('/').pop()) },
-          });
-          await bucket.delete(from);
+          const idx = await buildIndex(env);
+          const f = idx.files.get(from);
+          if (!f) return json({ error: '源文件不存在' }, 404, cors);
+          if (idx.files.has(to)) return json({ error: '目标已存在同名文件' }, 409, cors);
+          for (const p of f.parts) {
+            const resp = await fetch(p.url);
+            if (!resp.ok) throw new Error('复制分片失败 HTTP ' + resp.status);
+            const buf = new Uint8Array(await resp.arrayBuffer());
+            await uploadAsset(env, partName(to, p.n, p.size === 0), buf);
+          }
+          await dropFile(env, f);
           return json({ ok: true, from, to }, 200, cors);
         }
 
-        // 文件夹改名 / 移动（逐个对象复制后删除）
+        // 文件夹改名 / 移动
         if (route === '/mvdir') {
           const from = keyOf(body.from);
           const to = keyOf(body.to);
           if (!from || !to || from === to) return json({ error: '路径无效' }, 400, cors);
-          const list = await listAll(bucket, from + '/');
-          for (const o of list) {
-            const suffix = o.key.slice(from.length);
-            const dst = to + suffix;
-            if (dst !== o.key) {
-              const obj = await bucket.get(o.key);
-              if (obj) {
-                await bucket.put(dst, obj.body, {
-                  httpMetadata: obj.httpMetadata || { contentType: guessType(dst.split('/').pop()) },
-                });
-              }
+          const idx = await buildIndex(env);
+          const victims = [];
+          idx.files.forEach((f, path) => {
+            if (path.indexOf(from + '/') === 0) victims.push({ f, path });
+          });
+          for (const v of victims) {
+            const dst = to + v.path.slice(from.length);
+            for (const p of v.f.parts) {
+              const resp = await fetch(p.url);
+              if (!resp.ok) throw new Error('复制分片失败 HTTP ' + resp.status);
+              const buf = new Uint8Array(await resp.arrayBuffer());
+              await uploadAsset(env, partName(dst, p.n, p.size === 0), buf);
             }
+            await dropFile(env, v.f);
           }
-          for (let i = 0; i < list.length; i += 100) {
-            const batch = list.slice(i, i + 100).map((o) => o.key);
-            if (batch.length) await bucket.delete(batch);
+          // 目录占位也一起搬走
+          for (const d of idx.dirAssets) {
+            if (d.path !== from && d.path.indexOf(from + '/') !== 0) continue;
+            const dst = to + d.path.slice(from.length);
+            try {
+              await uploadAsset(env, dirName(dst), PLACEHOLDER);
+              await delAsset(env, d.id);
+            } catch (e) { /* 已存在则忽略 */ }
           }
-          return json({ ok: true, moved: list.length }, 200, cors);
+          return json({ ok: true, moved: victims.length }, 200, cors);
         }
 
-        // 分片：初始化
+        // 分片：初始化（清空同名旧分片）
         if (route === '/mp/init') {
           const key = keyOf(body.key);
           if (!key) return json({ error: '缺少 key' }, 400, cors);
-          const name = key.split('/').pop();
-          const mp = await bucket.createMultipartUpload(key, {
-            httpMetadata: { contentType: body.type || guessType(name) },
-          });
-          return json({ key, uploadId: mp.uploadId }, 200, cors);
+          const idx = await buildIndex(env);
+          const old = idx.files.get(key);
+          if (old) await dropFile(env, old);
+          return json({ key, uploadId: 'r' + Date.now().toString(36), partSize: 8 * 1024 * 1024 }, 200, cors);
         }
 
         // 分片：完成
         if (route === '/mp/complete') {
           const key = keyOf(body.key);
-          const uploadId = String(body.uploadId || '');
-          const parts = (Array.isArray(body.parts) ? body.parts : [])
-            .map((p) => ({ partNumber: Number(p.partNumber), etag: String(p.etag) }))
-            .filter((p) => p.partNumber > 0 && p.etag)
-            .sort((a, b) => a.partNumber - b.partNumber);
-          if (!key || !uploadId || !parts.length) return json({ error: '分片信息不完整' }, 400, cors);
-          const mp = bucket.resumeMultipartUpload(key, uploadId);
-          await mp.complete(parts);
-          return json({ ok: true, key, size: body.size || 0 }, 200, cors);
+          const want = (Array.isArray(body.parts) ? body.parts : []).length;
+          if (!key || !want) return json({ error: '分片信息不完整' }, 400, cors);
+          const idx = await buildIndex(env);
+          const f = idx.files.get(key);
+          if (!f || f.parts.length < want) {
+            return json({ error: '分片不完整（已收 ' + (f ? f.parts.length : 0) + '/' + want + '）' }, 400, cors);
+          }
+          if (f.parts.length > want) {
+            for (const p of f.parts.filter((x) => x.n > want)) {
+              try { await delAsset(env, p.id); } catch (e) { /* ignore */ }
+            }
+          }
+          return json({ ok: true, key, size: f.size }, 200, cors);
         }
 
-        // 分片：中止
+        // 分片：放弃
         if (route === '/mp/abort') {
           const key = keyOf(body.key);
-          const uploadId = String(body.uploadId || '');
-          if (key && uploadId) {
-            try {
-              await bucket.resumeMultipartUpload(key, uploadId).abort();
-            } catch (e) { /* 已经结束就忽略 */ }
-          }
+          const idx = await buildIndex(env);
+          const f = idx.files.get(key);
+          if (f) await dropFile(env, f);
           return json({ ok: true }, 200, cors);
         }
 
         return json({ error: '未知接口 ' + route }, 404, cors);
       }
 
-      // ---------- 分片：上传单片（PUT 二进制） ----------
+      /* ---------- 分片：上传单片 ---------- */
       if (request.method === 'PUT' && route === '/mp/part') {
         if (!passOk(headerPass)) return json({ error: '口令不正确' }, 401, cors);
         const key = keyOf(url.searchParams.get('key'));
-        const uploadId = String(url.searchParams.get('uploadId') || '');
         const n = Number(url.searchParams.get('n'));
-        if (!key || !uploadId || !(n > 0)) return json({ error: '缺少分片参数' }, 400, cors);
-        if (!request.body) return json({ error: '缺少分片数据' }, 400, cors);
-        const mp = bucket.resumeMultipartUpload(key, uploadId);
-        const part = await mp.uploadPart(n, request.body);
-        return json({ partNumber: part.partNumber, etag: part.etag }, 200, cors);
+        if (!key || !(n > 0)) return json({ error: '缺少分片参数' }, 400, cors);
+        const buf = await request.arrayBuffer();
+        const zero = buf.byteLength === 0;
+        const asset = await uploadAsset(
+          env,
+          partName(key, n, zero),
+          zero ? PLACEHOLDER : new Uint8Array(buf)
+        );
+        return json({ partNumber: n, etag: String(asset.id) }, 200, cors);
       }
 
       return json({ error: '未知接口 ' + route }, 404, cors);
